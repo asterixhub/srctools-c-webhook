@@ -25,7 +25,8 @@
 #define GAME_NAME "Parkour in the city"
 #define API_HOST "www.speedrun.com"
 #define API_BASE "/api/v1"
-#define RUN_EMBEDS "game,category,level,players"
+#define RUN_EMBEDS "category,level,players"
+#define RUN_PAGE 10
 #define CHECK_INTERVAL 8
 #define STATE_CAP 600
 
@@ -135,13 +136,17 @@ static bool use_new = true, use_verified = true, use_rejected = true;
 static char *trim_dup(const char *s){ while(*s==' '||*s=='\t'||*s=='\r'||*s=='\n') s++; size_t n=strlen(s); while(n>0&&(s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) n--; char*o=xmalloc(n+1); memcpy(o,s,n); o[n]=0; return o; }
 
 /* ---------------- TLS client ---------------- */
-typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; mbedtls_x509_crt cacrt; bool ok; } Tls;
+typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; bool ok; } Tls;
+static mbedtls_x509_crt g_cacrt;
+static bool g_ca_ready = false;
+
 static int tls_connect(Tls*t,const char*host,const char*port){
-    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); mbedtls_x509_crt_init(&t->cacrt); t->ok=false;
+    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); t->ok=false;
     if(mbedtls_ctr_drbg_seed(&t->ctr,mbedtls_entropy_func,&t->ent,(const unsigned char*)"s",1)!=0) return -1;
     if(mbedtls_net_connect(&t->net,host,port,MBEDTLS_NET_PROTO_TCP)!=0) return -1;
     if(mbedtls_ssl_config_defaults(&t->conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)!=0) return -1;
-    if(mbedtls_x509_crt_parse_file(&t->cacrt,"/etc/ssl/certs/ca-certificates.crt")==0){ mbedtls_ssl_conf_ca_chain(&t->conf,&t->cacrt,NULL); mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
+    if(!g_ca_ready){ mbedtls_x509_crt_init(&g_cacrt); if(mbedtls_x509_crt_parse_file(&g_cacrt,"/etc/ssl/certs/ca-certificates.crt")==0) g_ca_ready=true; else mbedtls_x509_crt_free(&g_cacrt); }
+    if(g_ca_ready){ mbedtls_ssl_conf_ca_chain(&t->conf,&g_cacrt,NULL); mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
     else mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&t->conf,mbedtls_ctr_drbg_random,&t->ctr);
     if(mbedtls_ssl_setup(&t->ssl,&t->conf)!=0) return -1;
@@ -152,7 +157,7 @@ static int tls_connect(Tls*t,const char*host,const char*port){
 }
 static int tls_write_all(Tls*t,const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&t->ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
 static char* tls_read_all(Tls*t,size_t*olen){ Buf b; binit(&b); unsigned char tmp[4096]; for(;;){ int r=mbedtls_ssl_read(&t->ssl,tmp,sizeof tmp); if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE) continue; if(r==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY||r==0) break; if(r<0) break; badd(&b,tmp,(size_t)r);} *olen=b.n; return b.d; }
-static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); mbedtls_x509_crt_free(&t->cacrt); }
+static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); }
 
 static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status){
     Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); return NULL; }
@@ -245,27 +250,29 @@ static char* player_name_from_obj(const char*obj){
 
 static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
-    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=20",API_BASE,game_id,status,orderby,RUN_EMBEDS);
+    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE);
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
     int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
     if(!body||st<200||st>=300){ if(body) free(body); return; }
-    char*data=json_get_raw(body,"data"); free(body); if(!data||data[0]!='['){ if(data) free(data); return; }
+    const char*data=find_key(body,"data");
+    if(!data||*data!='['){ free(body); return; }
 
     int fi=fidx(kind);
-    /* collect run ids in order */
-    char ids[40][32]; int nids=0; char*run_objs[40]; memset(run_objs,0,sizeof run_objs);
-    const char*p=data+1; int depth=0; bool in_str=false,esc=false;
-    while(*p && nids<20){
-        p=(char*)skip_ws(p); if(*p==']') break; if(*p!= '{'){ p++; continue; }
-        const char*start=p; depth=0; in_str=false; esc=false;
+    /* collect run ids in order (parsed in place, no copy of the whole feed) */
+    char ids[RUN_PAGE+2][32]; int nids=0; const char*objs[RUN_PAGE+2];
+    const char*p=data+1;
+    while(*p && nids<RUN_PAGE){
+        p=skip_ws(p); if(*p==']') break; if(*p!='{'){ p++; continue; }
+        const char*start=p; int depth=0; bool in_str=false,esc=false;
         do{ char c=*p; if(in_str){ if(esc) esc=false; else if(c=='\\') esc=true; else if(c=='"') in_str=false; } else { if(c=='"') in_str=true; else if(c=='{') depth++; else if(c=='}') depth--; } p++; }while(*p && depth>0);
-        size_t len=(size_t)(p-start); char*obj=xmalloc(len+1); memcpy(obj,start,len); obj[len]=0;
-        char*id=json_get_string(obj,"id"); if(id){ strncpy(ids[nids],id,31); ids[nids][31]=0; run_objs[nids]=obj; nids++; free(id);} else free(obj);
-        p=(char*)skip_ws(p); if(*p==',') p++;
+        bool got=false;
+        { const char*idp=find_key(start,"id"); if(idp&&*idp=='"'){ const char*q=idp+1; size_t n=0; while(*q&&*q!='"'&&n<31){ ids[nids][n++]=*q++; } ids[nids][n]=0; got=true; } }
+        if(got){ objs[nids]=start; nids++; }
+        p=skip_ws(p); if(*p==',') p++;
     }
 
     /* determine notifications */
-    char notify[40][32]; int nn=0;
+    char notify[RUN_PAGE+2][32]; int nn=0;
     bool was_primed=fst[fi].primed;
     if(!was_primed){ fst[fi].primed=true; state_dirty=true; }
     else {
@@ -278,9 +285,9 @@ static void process_feed(const char*status,const char*kind){
     /* send notifications */
     for(int k=0;k<nn;k++){
         /* find object */
-        char*obj=NULL; for(int i=0;i<nids;i++) if(strcmp(ids[i],notify[k])==0){ obj=run_objs[i]; break; }
+        const char*obj=NULL; for(int i=0;i<nids;i++) if(strcmp(ids[i],notify[k])==0){ obj=objs[i]; break; }
         if(!obj) continue;
-        char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(64); snprintf(run_url,64,"https://www.speedrun.com/pitc/run/%s",notify[k]); }
+        char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(96); snprintf(run_url,96,"https://www.speedrun.com/pitc/runs/%s",notify[k]); }
         char*cat_raw=json_get_raw(obj,"category"); char*lvl_raw=json_get_raw(obj,"level"); char*players_raw=json_get_raw(obj,"players");
         char*mapn=NULL; if(lvl_raw&&lvl_raw[0]=='{') mapn=json_get_string(lvl_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn && cat_raw&&cat_raw[0]=='{') mapn=json_get_string(cat_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn) mapn=xstrdup("Run");
         char*runner=xstrdup("Unknown runner");
@@ -295,8 +302,7 @@ static void process_feed(const char*status,const char*kind){
         msleep(800);
     }
 
-    for(int i=0;i<nids;i++) if(run_objs[i]) free(run_objs[i]);
-    free(data);
+    free(body);
     state_save_file();
 }
 

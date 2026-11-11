@@ -255,12 +255,29 @@ static char* player_name_from_obj(const char*obj){
     char*n=json_get_string(obj,"name"); if(n) return n; return xstrdup("Unknown runner");
 }
 
+static bool g_test_once = false;
+
+static void notify_run(const char*kind,const char*obj,const char*run_id){
+    char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(96); snprintf(run_url,96,"https://www.speedrun.com/pitc/runs/%s",run_id); }
+    char*cat_raw=json_get_raw(obj,"category"); char*lvl_raw=json_get_raw(obj,"level"); char*players_raw=json_get_raw(obj,"players");
+    char*mapn=NULL; if(lvl_raw) mapn=json_embedded_string(lvl_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn && cat_raw) mapn=json_embedded_string(cat_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn) mapn=xstrdup("Unknown map");
+    char*runner=xstrdup("Unknown runner");
+    if(players_raw&&players_raw[0]=='{'){ char*d=json_get_raw(players_raw,"data"); if(d&&d[0]=='['){ const char*q=skip_ws(d+1); if(*q=='{'){ int dp=0; bool ins=false,es=false; const char*st=q; do{ char c=*q; if(ins){if(es)es=false;else if(c=='\\')es=true;else if(c=='"')ins=false;} else {if(c=='"')ins=true; else if(c=='{')dp++; else if(c=='}')dp--; } q++; }while(*q && dp>0); size_t l=(size_t)(q-st); char*po=xmalloc(l+1); memcpy(po,st,l); po[l]=0; free(runner); runner=player_name_from_obj(po); free(po);} } if(d) free(d);} 
+    char*t_raw=json_get_raw(obj,"times"); double psec=0; if(t_raw&&t_raw[0]=='{') psec=json_get_num(t_raw,"primary_t",0); if(t_raw) free(t_raw);
+    Buf tb; binit(&tb); if(psec>0) fmt_compact(&tb,psec); else bputs(&tb,"?"); char*time_s=xstrdup(tb.d); bfree(&tb);
+    char*reason=NULL; if(strcmp(kind,"rejected")==0){ char*straw=json_get_raw(obj,"status"); if(straw&&straw[0]=='{') reason=json_get_string(straw,"reason"); if(straw) free(straw); }
+    char*mapc=clean(mapn,256); char*runc=clean(runner,256); char*reas_c=reason?clean(reason,300):NULL;
+    printf("[Worker] %s %s -> %s in %s by %s\n",kind,run_id,mapc,time_s,runc); fflush(stdout);
+    send_discord(kind,run_url,mapc,time_s,runc,reas_c?reas_c:"");
+    free(mapc); free(runc); if(reas_c) free(reas_c); if(reason) free(reason); free(time_s); free(runner); free(mapn); if(players_raw) free(players_raw); if(lvl_raw) free(lvl_raw); if(cat_raw) free(cat_raw); free(run_url);
+}
+
 static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
     snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d&_=%lld",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE,(long long)now_ms());
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
     int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
-    if(!body||st<200||st>=300){ if(body) free(body); return; }
+    if(!body||st<200||st>=300){ printf("[Worker] feed %s: request failed (http %d)\n",kind,st); fflush(stdout); if(body) free(body); return; }
     const char*data=find_key(body,"data");
     if(!data||*data!='['){ free(body); return; }
 
@@ -291,23 +308,12 @@ static void process_feed(const char*status,const char*kind){
     state_save_file();
     /* send notifications */
     for(int k=0;k<nn;k++){
-        /* find object */
         const char*obj=NULL; for(int i=0;i<nids;i++) if(strcmp(ids[i],notify[k])==0){ obj=objs[i]; break; }
         if(!obj) continue;
-        char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(96); snprintf(run_url,96,"https://www.speedrun.com/pitc/runs/%s",notify[k]); }
-        char*cat_raw=json_get_raw(obj,"category"); char*lvl_raw=json_get_raw(obj,"level"); char*players_raw=json_get_raw(obj,"players");
-        char*mapn=NULL; if(lvl_raw) mapn=json_embedded_string(lvl_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn && cat_raw) mapn=json_embedded_string(cat_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn) mapn=xstrdup("Unknown map");
-        char*runner=xstrdup("Unknown runner");
-        if(players_raw&&players_raw[0]=='{'){ char*d=json_get_raw(players_raw,"data"); if(d&&d[0]=='['){ /* first element */ const char*q=skip_ws(d+1); if(*q=='{'){ int dp=0; bool ins=false,es=false; const char*st=q; do{ char c=*q; if(ins){if(es)es=false;else if(c=='\\')es=true;else if(c=='"')ins=false;} else {if(c=='"')ins=true; else if(c=='{')dp++; else if(c=='}')dp--; } q++; }while(*q && dp>0); size_t l=(size_t)(q-st); char*po=xmalloc(l+1); memcpy(po,st,l); po[l]=0; free(runner); runner=player_name_from_obj(po); free(po);} } if(d) free(d);} 
-        char*t_raw=json_get_raw(obj,"times"); double psec=0; if(t_raw&&t_raw[0]=='{') psec=json_get_num(t_raw,"primary_t",0); if(t_raw) free(t_raw);
-        Buf tb; binit(&tb); if(psec>0) fmt_compact(&tb,psec); else bputs(&tb,"?"); char*time_s=xstrdup(tb.d); bfree(&tb);
-        char*reason=NULL; if(strcmp(kind,"rejected")==0){ char*straw=json_get_raw(obj,"status"); if(straw&&straw[0]=='{') reason=json_get_string(straw,"reason"); if(straw) free(straw); }
-        char*mapc=clean(mapn,256); char*runc=clean(runner,256); char*reas_c=reason?clean(reason,300):NULL;
-        printf("[Worker] %s %s\n",kind,notify[k]); fflush(stdout);
-        send_discord(kind,run_url,mapc,time_s,runc,reas_c?reas_c:"");
-        free(mapc); free(runc); if(reas_c) free(reas_c); if(reason) free(reason); free(time_s); free(runner); free(mapn); if(players_raw) free(players_raw); if(lvl_raw) free(lvl_raw); if(cat_raw) free(cat_raw); free(run_url);
+        notify_run(kind,obj,notify[k]);
         msleep(800);
     }
+    if(g_test_once && nids>0){ notify_run(kind,objs[0],ids[0]); g_test_once=false; }
 
     free(body);
     state_save_file();
@@ -329,7 +335,7 @@ int main(void){
     if(!(reset&&strcmp(reset,"1")==0)) state_load_file();
     printf("[Worker] Started; polling every %ds (game=%s %s)\n",interval_sec,game_id,GAME_NAME); fflush(stdout);
     const char*test=getenv("TEST_NOTIFY");
-    if(test&&strcmp(test,"1")==0){ bool ok=send_discord("new","https://www.speedrun.com/pitc","Parkour in the city","0m 12s 345ms","Test runner",""); printf("[Worker] Test notification: %s\n",ok?"sent":"failed"); fflush(stdout); }
+    if(test&&strcmp(test,"1")==0) g_test_once=true;
     while(!stopflag){
         long t0=now_ms();
         if(use_new) process_feed("new","new");

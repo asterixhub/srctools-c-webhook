@@ -18,9 +18,6 @@
 #define MBEDTLS_CIPHER_C
 #define MBEDTLS_AES_C
 #define MBEDTLS_GCM_C
-#define MBEDTLS_CHACHA20_C
-#define MBEDTLS_POLY1305_C
-#define MBEDTLS_CHACHAPOLY_C
 
 /* asymmetric / x509 */
 #define MBEDTLS_BIGNUM_C

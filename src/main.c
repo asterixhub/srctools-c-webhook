@@ -28,7 +28,7 @@
 #define RUN_EMBEDS "category,level,players"
 #define RUN_PAGE 10
 #define CHECK_INTERVAL 8
-#define STATE_CAP 600
+#define STATE_CAP 100
 
 typedef struct { char *d; size_t n, c; } Buf;
 typedef struct { char *s; size_t n; } Str;

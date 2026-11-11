@@ -250,7 +250,7 @@ static char* player_name_from_obj(const char*obj){
 
 static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
-    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE);
+    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d&_=%lld",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE,(long long)now_ms());
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
     int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
     if(!body||st<200||st>=300){ if(body) free(body); return; }

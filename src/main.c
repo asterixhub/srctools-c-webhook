@@ -180,11 +180,17 @@ static bool state_dirty=false;
 
 static int fidx(const char*k){ if(strcmp(k,"new")==0) return 0; if(strcmp(k,"verified")==0) return 1; return 2; }
 static void state_load_file(void){ for(int i=0;i<3;i++){ fst[i].primed=false; fst[i].high[0]=0; fst[i].nseen=0; }
-    FILE*f=fopen(state_path,"r"); if(!f) return; char line[4096];
-    while(fgets(line,sizeof line,f)){ char*k=strtok(line,"|"); char*pr=strtok(NULL,"|"); char*hw=strtok(NULL,"|"); char*ids=strtok(NULL,"\n");
-        if(!k) continue; int i=fidx(k); if(i<0||i>2) continue; fst[i].primed=pr&&strcmp(pr,"1")==0; if(hw) strncpy(fst[i].high,hw,sizeof fst[i].high-1);
-        fst[i].nseen=0; if(ids){ char*tok=strtok(ids,","); while(tok&&fst[i].nseen<STATE_CAP){ while(*tok==' ') tok++; char*e=tok+strlen(tok); while(e>tok&&isspace((unsigned char)e[-1])) *--e=0; if(*tok){ strncpy(fst[i].seen[fst[i].nseen].id,tok,31); fst[i].seen[fst[i].nseen].id[31]=0; fst[i].nseen++; } tok=strtok(NULL,","); } }
-    } fclose(f);
+    FILE*f=fopen(state_path,"r"); if(!f) return;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    char*all=xmalloc((size_t)sz+2); size_t rd=fread(all,1,(size_t)sz,f); all[rd]=0; all[rd+1]=0; fclose(f);
+    char*line=all;
+    while(line&&*line){
+        char*nl=strchr(line,'\n'); if(nl) *nl=0;
+        char*k=strtok(line,"|"); char*pr=strtok(NULL,"|"); char*hw=strtok(NULL,"|"); char*ids=strtok(NULL,"");
+        if(k){ int i=fidx(k); if(i>=0&&i<3){ fst[i].primed=pr&&strcmp(pr,"1")==0; if(hw) strncpy(fst[i].high,hw,sizeof fst[i].high-1); fst[i].nseen=0; if(ids){ char*tok=strtok(ids,","); while(tok&&fst[i].nseen<STATE_CAP){ while(*tok==' ') tok++; char*e=tok+strlen(tok); while(e>tok&&isspace((unsigned char)e[-1])) *--e=0; if(*tok){ strncpy(fst[i].seen[fst[i].nseen].id,tok,31); fst[i].seen[fst[i].nseen].id[31]=0; fst[i].nseen++; } tok=strtok(NULL,","); } } } }
+        line=nl?nl+1:NULL;
+    }
+    free(all);
 }
 static void state_save_file(void){ if(!state_dirty) return; FILE*f=fopen(state_path,"w"); if(!f) return; const char*names[3]={"new","verified","rejected"}; for(int i=0;i<3;i++){ fprintf(f,"%s|%d|%s|",names[i],fst[i].primed?1:0,fst[i].high); for(int j=0;j<fst[i].nseen;j++){ if(j) fputc(',',f); fprintf(f,"%s",fst[i].seen[j].id);} fputc('\n',f);} fclose(f); state_dirty=false; }
 static bool seen_has(int fi,const char*id){ for(int j=0;j<fst[fi].nseen;j++) if(strcmp(fst[fi].seen[j].id,id)==0) return true; return false; }
@@ -207,10 +213,16 @@ static bool send_discord(const char*kind,const char*run_url,const char*map,const
     char desc[1200]; if(reason&&reason[0]) snprintf(desc,sizeof desc,"%s in %s by %s\nReason: %s",map,time_s,runner,reason); else snprintf(desc,sizeof desc,"%s in %s by %s",map,time_s,runner);
     bputs(&pl,",\"description\":"); json_escape(&pl,desc);
     bfmt(&pl,",\"color\":%ld}],\"allowed_mentions\":{\"parse\":[]}}",ev_color(kind));
-    int st=0; char*resp=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); bfree(&pl); if(resp) free(resp);
-    if(st==204||st==200) return true;
-    if(st==429){ msleep(1200); char*resp2=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); if(resp2) free(resp2); return (st==204||st==200);} /* pl freed, but rare; acceptable minimal */
-    return false;
+    bool ok=false;
+    for(int attempt=1;attempt<=3;attempt++){
+        int st=0; char*resp=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); if(resp) free(resp);
+        if(st==204||st==200){ ok=true; break; }
+        if(st==429){ msleep(1500); continue; }
+        if(st>=500){ msleep(1000*attempt); continue; }
+        break;
+    }
+    bfree(&pl);
+    return ok;
 }
 
 /* extract runs and notify */
@@ -265,7 +277,7 @@ static void process_feed(const char*status,const char*kind){
         Buf tb; binit(&tb); if(psec>0) fmt_compact(&tb,psec); else bputs(&tb,"?"); char*time_s=xstrdup(tb.d); bfree(&tb);
         char*reason=NULL; if(strcmp(kind,"rejected")==0){ char*straw=json_get_raw(obj,"status"); if(straw&&straw[0]=='{') reason=json_get_string(straw,"reason"); if(straw) free(straw); }
         char*mapc=clean(mapn,256); char*runc=clean(runner,256); char*reas_c=reason?clean(reason,300):NULL;
-        fprintf(stderr,"[Worker] %s %s\n",kind,notify[k]);
+        printf("[Worker] %s %s\n",kind,notify[k]); fflush(stdout);
         send_discord(kind,run_url,mapc,time_s,runc,reas_c?reas_c:"");
         free(mapc); free(runc); if(reas_c) free(reas_c); if(reason) free(reason); free(time_s); free(runner); free(mapn); if(players_raw) free(players_raw); if(lvl_raw) free(lvl_raw); if(cat_raw) free(cat_raw); free(run_url);
         msleep(800);
@@ -278,6 +290,7 @@ static void process_feed(const char*status,const char*kind){
 
 int main(void){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
+    setvbuf(stdout,NULL,_IOLBF,0);
     const char*wh=getenv("DISCORD_WEBHOOK_URL");
     if(!wh||!wh[0]) wh="https://discord.com/api/webhooks/1570141754944921721/x70Kdz7KhNppLEErIfqFc3UyRKDTFqaCqtIaGc7iNrKHwlbIrl3KhlNsLJDXDU59AAPq";
     parse_webhook(wh);
@@ -285,7 +298,9 @@ int main(void){
     mkdir(vol,0755);
     snprintf(state_path,sizeof state_path,"%s/state.txt",vol);
     state_load_file();
-    fprintf(stderr,"[Worker] Started; polling every %ds (game=%s %s)\n",CHECK_INTERVAL,GAME_ID,GAME_NAME);
+    printf("[Worker] Started; polling every %ds (game=%s %s)\n",CHECK_INTERVAL,GAME_ID,GAME_NAME); fflush(stdout);
+    const char*test=getenv("TEST_NOTIFY");
+    if(test&&strcmp(test,"1")==0){ bool ok=send_discord("new","https://www.speedrun.com/pitc","Parkour in the city","0m 12s 345ms","Test runner",""); printf("[Worker] Test notification: %s\n",ok?"sent":"failed"); fflush(stdout); }
     while(!stopflag){
         long t0=now_ms();
         process_feed("new","new");
@@ -297,6 +312,6 @@ int main(void){
         long end=now_ms()+wait; while(!stopflag && now_ms()<end) msleep(250);
     }
     state_save_file();
-    fprintf(stderr,"[Worker] Stopped\n");
+    printf("[Worker] Stopped\n"); fflush(stdout);
     return 0;
 }

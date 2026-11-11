@@ -1,15 +1,9 @@
 ﻿# syntax=docker/dockerfile:1
 FROM alpine:3.20 AS build
-RUN apk add --no-cache gcc musl-dev make curl tar
+RUN apk add --no-cache gcc musl-dev mbedtls-dev mbedtls-static
 WORKDIR /src
-RUN curl -fsSL https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-3.6.0.tar.gz -o m.tar.gz \
- && tar -xzf m.tar.gz && mv mbedtls-mbedtls-3.6.0 mbedtls
-COPY mbedtls_config.h /src/mbedtls_config.h
 COPY src/main.c /src/main.c
-RUN cd mbedtls && make -j4 lib CFLAGS="-O2 -I/src -DMBEDTLS_CONFIG_FILE='\"/src/mbedtls_config.h\"'" \
- && cd /src \
- && gcc -O2 -s -static -I/src -I/src/mbedtls/include -DMBEDTLS_CONFIG_FILE='"/src/mbedtls_config.h"' \
-    -o /worker main.c mbedtls/library/libmbedcrypto.a mbedtls/library/libmbedx509.a mbedtls/library/libmbedtls.a
+RUN gcc -O2 -s -static -o /worker main.c -lmbedtls -lmbedx509 -lmbedcrypto
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

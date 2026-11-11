@@ -164,6 +164,7 @@ static bool tls_setup(void){
     if(g_ca_ready){ mbedtls_ssl_conf_ca_chain(&g_conf,&g_cacrt,NULL); mbedtls_ssl_conf_authmode(&g_conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
     else mbedtls_ssl_conf_authmode(&g_conf,MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&g_conf,mbedtls_ctr_drbg_random,&g_ctr);
+    if(mbedtls_ssl_setup(&g_ssl,&g_conf)!=0) return false;
     g_tls_ready=true; return true;
 }
 

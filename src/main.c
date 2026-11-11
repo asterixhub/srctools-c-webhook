@@ -18,6 +18,7 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
 
 #define GAME_ID "o1y3oqv6"
@@ -126,13 +127,14 @@ static double json_get_num(const char*obj,const char*key,double def){
     char*r=json_get_raw(obj,key); if(!r) return def; double d=strtod(r,NULL); free(r); return d; }
 
 /* TLS client */
-typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; bool ok; } Tls;
+typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; mbedtls_x509_crt cacrt; bool ok; } Tls;
 static int tls_connect(Tls*t,const char*host,const char*port){
-    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); t->ok=false;
+    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); mbedtls_x509_crt_init(&t->cacrt); t->ok=false;
     if(mbedtls_ctr_drbg_seed(&t->ctr,mbedtls_entropy_func,&t->ent,(const unsigned char*)"s",1)!=0) return -1;
     if(mbedtls_net_connect(&t->net,host,port,MBEDTLS_NET_PROTO_TCP)!=0) return -1;
     if(mbedtls_ssl_config_defaults(&t->conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)!=0) return -1;
-    mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_NONE);
+    if(mbedtls_x509_crt_parse_file(&t->cacrt,"/etc/ssl/certs/ca-certificates.crt")==0){ mbedtls_ssl_conf_ca_chain(&t->conf,&t->cacrt,NULL); mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
+    else mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&t->conf,mbedtls_ctr_drbg_random,&t->ctr);
     if(mbedtls_ssl_setup(&t->ssl,&t->conf)!=0) return -1;
     mbedtls_ssl_set_hostname(&t->ssl,host);
@@ -142,7 +144,7 @@ static int tls_connect(Tls*t,const char*host,const char*port){
 }
 static int tls_write_all(Tls*t,const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&t->ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
 static char* tls_read_all(Tls*t,size_t*olen){ Buf b; binit(&b); unsigned char tmp[4096]; for(;;){ int r=mbedtls_ssl_read(&t->ssl,tmp,sizeof tmp); if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE) continue; if(r==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY||r==0) break; if(r<0) break; badd(&b,tmp,(size_t)r);} *olen=b.n; return b.d; }
-static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); }
+static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); mbedtls_x509_crt_free(&t->cacrt); }
 
 static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status){
     Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); return NULL; }
@@ -173,26 +175,26 @@ static void parse_webhook(const char*url){
 
 /* state: simple persistence */
 typedef struct { char id[32]; } Seen;
-typedef struct { char feed[8]; bool primed; char high[64]; Seen seen[STATE_CAP]; int nseen; } FState;
+typedef struct { char feed[8]; bool primed; Seen seen[STATE_CAP]; int nseen; } FState;
 static FState fst[3];
 static char state_path[512];
 static bool state_dirty=false;
 
 static int fidx(const char*k){ if(strcmp(k,"new")==0) return 0; if(strcmp(k,"verified")==0) return 1; return 2; }
-static void state_load_file(void){ for(int i=0;i<3;i++){ fst[i].primed=false; fst[i].high[0]=0; fst[i].nseen=0; }
+static void state_load_file(void){ for(int i=0;i<3;i++){ fst[i].primed=false; fst[i].nseen=0; }
     FILE*f=fopen(state_path,"r"); if(!f) return;
     fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
     char*all=xmalloc((size_t)sz+2); size_t rd=fread(all,1,(size_t)sz,f); all[rd]=0; all[rd+1]=0; fclose(f);
     char*line=all;
     while(line&&*line){
         char*nl=strchr(line,'\n'); if(nl) *nl=0;
-        char*k=strtok(line,"|"); char*pr=strtok(NULL,"|"); char*hw=strtok(NULL,"|"); char*ids=strtok(NULL,"");
-        if(k){ int i=fidx(k); if(i>=0&&i<3){ fst[i].primed=pr&&strcmp(pr,"1")==0; if(hw) strncpy(fst[i].high,hw,sizeof fst[i].high-1); fst[i].nseen=0; if(ids){ char*tok=strtok(ids,","); while(tok&&fst[i].nseen<STATE_CAP){ while(*tok==' ') tok++; char*e=tok+strlen(tok); while(e>tok&&isspace((unsigned char)e[-1])) *--e=0; if(*tok){ strncpy(fst[i].seen[fst[i].nseen].id,tok,31); fst[i].seen[fst[i].nseen].id[31]=0; fst[i].nseen++; } tok=strtok(NULL,","); } } } }
+        char*k=strtok(line,"|"); char*pr=strtok(NULL,"|"); char*ids=strtok(NULL,"");
+        if(k){ int i=fidx(k); if(i>=0&&i<3){ fst[i].primed=pr&&strcmp(pr,"1")==0; fst[i].nseen=0; if(ids){ char*tok=strtok(ids,","); while(tok&&fst[i].nseen<STATE_CAP){ while(*tok==' ') tok++; char*e=tok+strlen(tok); while(e>tok&&isspace((unsigned char)e[-1])) *--e=0; if(*tok){ strncpy(fst[i].seen[fst[i].nseen].id,tok,31); fst[i].seen[fst[i].nseen].id[31]=0; fst[i].nseen++; } tok=strtok(NULL,","); } } } }
         line=nl?nl+1:NULL;
     }
     free(all);
 }
-static void state_save_file(void){ if(!state_dirty) return; FILE*f=fopen(state_path,"w"); if(!f) return; const char*names[3]={"new","verified","rejected"}; for(int i=0;i<3;i++){ fprintf(f,"%s|%d|%s|",names[i],fst[i].primed?1:0,fst[i].high); for(int j=0;j<fst[i].nseen;j++){ if(j) fputc(',',f); fprintf(f,"%s",fst[i].seen[j].id);} fputc('\n',f);} fclose(f); state_dirty=false; }
+static void state_save_file(void){ if(!state_dirty) return; FILE*f=fopen(state_path,"w"); if(!f) return; const char*names[3]={"new","verified","rejected"}; for(int i=0;i<3;i++){ fprintf(f,"%s|%d|",names[i],fst[i].primed?1:0); for(int j=0;j<fst[i].nseen;j++){ if(j) fputc(',',f); fprintf(f,"%s",fst[i].seen[j].id);} fputc('\n',f);} fclose(f); state_dirty=false; }
 static bool seen_has(int fi,const char*id){ for(int j=0;j<fst[fi].nseen;j++) if(strcmp(fst[fi].seen[j].id,id)==0) return true; return false; }
 static void seen_add(int fi,const char*id){ if(seen_has(fi,id)) return; if(fst[fi].nseen<STATE_CAP){ strncpy(fst[fi].seen[fst[fi].nseen].id,id,31); fst[fi].seen[fst[fi].nseen].id[31]=0; fst[fi].nseen++; }
     else { memmove(&fst[fi].seen[0],&fst[fi].seen[1],sizeof(Seen)*(STATE_CAP-1)); strncpy(fst[fi].seen[STATE_CAP-1].id,id,31); fst[fi].seen[STATE_CAP-1].id[31]=0; } state_dirty=true; }
@@ -226,7 +228,6 @@ static bool send_discord(const char*kind,const char*run_url,const char*map,const
 }
 
 /* extract runs and notify */
-static char* get_nested(const char*obj,const char*k1,const char*k2){ char*r=json_get_raw(obj,k1); if(!r) return NULL; char*o=NULL; if(r[0]=='{') o=json_get_string(r,k2); else if(r[0]=='"' ){ /* id string */ } free(r); return o; }
 static char* player_name_from_obj(const char*obj){
     char*names=json_get_raw(obj,"names");
     if(names && names[0]=='{'){ char*n=json_get_string(names,"international"); if(!n) n=json_get_string(names,"japanese"); if(n){ free(names); return n; } }
@@ -257,12 +258,15 @@ static void process_feed(const char*status,const char*kind){
 
     /* determine notifications */
     char notify[40][32]; int nn=0;
-    if(!fst[fi].primed){ fst[fi].primed=true; state_dirty=true; }
+    bool was_primed=fst[fi].primed;
+    if(!was_primed){ fst[fi].primed=true; state_dirty=true; }
     else {
         for(int i=nids-1;i>=0;i--){ if(!seen_has(fi,ids[i])){ strncpy(notify[nn],ids[i],31); notify[nn][31]=0; nn++; } }
     }
+    printf("[Worker] feed %s: %d run(s), primed=%d, notify=%d\n",kind,nids,(int)was_primed,nn); fflush(stdout);
     /* update seen and highwater */
     for(int i=0;i<nids;i++){ seen_add(fi,ids[i]); }
+    state_save_file();
     /* send notifications */
     for(int k=0;k<nn;k++){
         /* find object */
@@ -297,7 +301,8 @@ int main(void){
     const char*vol=getenv("RAILWAY_VOLUME_MOUNT_PATH"); if(!vol||!*vol) vol="./data";
     mkdir(vol,0755);
     snprintf(state_path,sizeof state_path,"%s/state.txt",vol);
-    state_load_file();
+    const char*reset=getenv("RESET_STATE");
+    if(!(reset&&strcmp(reset,"1")==0)) state_load_file();
     printf("[Worker] Started; polling every %ds (game=%s %s)\n",CHECK_INTERVAL,GAME_ID,GAME_NAME); fflush(stdout);
     const char*test=getenv("TEST_NOTIFY");
     if(test&&strcmp(test,"1")==0){ bool ok=send_discord("new","https://www.speedrun.com/pitc","Parkour in the city","0m 12s 345ms","Test runner",""); printf("[Worker] Test notification: %s\n",ok?"sent":"failed"); fflush(stdout); }

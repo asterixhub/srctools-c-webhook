@@ -173,34 +173,44 @@ static int tls_connect(Tls*t,const char*host,const char*port){
     t->ok=true; return 0;
 }
 static int tls_write_all(Tls*t,const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&t->ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
-static int tls_read_all(Tls*t,char*dst,size_t dstsz){
-    size_t n=0; unsigned char tmp[4096]; int spins=0;
-    for(;;){ int r=mbedtls_ssl_read(&t->ssl,tmp,sizeof tmp);
-        if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE){ if(++spins>3) return -1; continue; }
-        if(r<=0) break; if(n+(size_t)r>=dstsz) return -1; memcpy(dst+n,tmp,(size_t)r); n+=(size_t)r; }
-    dst[n]=0; return 0;
-}
 static void tls_close(Tls*t){ if(t->ok) mbedtls_ssl_close_notify(&t->ssl); mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); mbedtls_x509_crt_free(&t->cacrt); }
 
-/* Возвращает базовый указатель буфера (вызывающий освобождает), тело ответа - в out_body. */
-static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status,char**out_body){
-    char*buf=xmalloc(RESP_BUF);
-    Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); free(buf); return NULL; }
+/* Возвращает указатель на тело ответа (вызывающий освобождает через free).
+   Буфер выделяется ровно под Content-Length, поэтому лишней памяти в куче нет. */
+static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status){
+    Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); return NULL; }
     Buf req; binit(&req);
     bfmt(&req,"%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: s\r\nConnection: close\r\n",method,path,host);
     if(extra_hdr&&extra_hdr[0]) bputs(&req,extra_hdr);
     if(body){ bfmt(&req,"Content-Type: application/json\r\nContent-Length: %zu\r\n",strlen(body)); }
     bputs(&req,"\r\n");
     if(body) bputs(&req,body);
-    if(tls_write_all(&t,(unsigned char*)req.d,req.n)!=0){ bfree(&req); tls_close(&t); free(buf); return NULL; }
+    if(tls_write_all(&t,(unsigned char*)req.d,req.n)!=0){ bfree(&req); tls_close(&t); return NULL; }
     bfree(&req);
-    int rc=tls_read_all(&t,buf,RESP_BUF);
+    /* читаем заголовки до пустой строки */
+    char hdr[4096]; size_t hn=0; int spins=0; bool got_hdr=false;
+    while(hn+1<sizeof hdr){
+        size_t g=0; int r=mbedtls_ssl_read(&t.ssl,(unsigned char*)hdr+hn,1); g=(r>0)?(size_t)r:0;
+        if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE){ if(++spins>3) break; continue; }
+        if(r<=0) break;
+        hn+=g;
+        if(hn>=4 && memcmp(hdr+hn-4,"\r\n\r\n",4)==0){ got_hdr=true; break; }
+    }
+    if(!got_hdr){ tls_close(&t); return NULL; }
+    hdr[hn]=0;
+    *status=0; if(sscanf(hdr,"HTTP/%*d.%*d %d",status)!=1) *status=0;
+    size_t clen=RESP_BUF;
+    { char*cl=strcasestr(hdr,"content-length:"); if(cl){ long v=strtol(cl+15,NULL,10); if(v>0&&v<1024*1024) clen=(size_t)v; } }
+    char*buf=xmalloc(clen+1);
+    size_t n=0;
+    while(n<clen){
+        size_t g=0; int r=mbedtls_ssl_read(&t.ssl,(unsigned char*)buf+n,clen-n); g=(r>0)?(size_t)r:0;
+        if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE){ if(++spins>3) break; continue; }
+        if(r<=0) break;
+        n+=g;
+    }
+    buf[n]=0;
     tls_close(&t);
-    if(rc!=0){ free(buf); return NULL; }
-    *status=0;
-    char*sp=strstr(buf,"\r\n\r\n"); if(!sp){ free(buf); return NULL; }
-    *sp=0; *out_body=sp+4;
-    if(sscanf(buf,"HTTP/%*d.%*d %d",status)!=1) *status=0;
     return buf;
 }
 /* Discord webhook host/path split */
@@ -255,7 +265,7 @@ static bool send_discord(const char*kind,const char*run_url,const char*map,const
     bfmt(&pl,",\"color\":%ld}],\"allowed_mentions\":{\"parse\":[]}}",ev_color(kind));
     bool ok=false;
     for(int attempt=1;attempt<=3;attempt++){
-        int st=0; char*dbody=NULL; char*dbuf=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st,&dbody); if(dbuf) free(dbuf);
+        int st=0; char*dbuf=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); if(dbuf) free(dbuf);
         if(st==204||st==200){ ok=true; break; }
         if(st==429){ msleep(1500); continue; }
         if(st>=500){ msleep(1000*attempt); continue; }
@@ -301,11 +311,11 @@ static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
     snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d&_=%lld",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE,(long long)now_ms());
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
-    int st=0; char*resp_body=NULL;
-    char*raw=https_request(API_HOST,path,"GET",NULL,hdr,&st,&resp_body);
-    if(!raw||st<200||st>=300){ printf("[Worker] feed %s: request failed (http %d)\n",kind,st); fflush(stdout); if(raw) free(raw); return; }
-    const char*data=find_key(resp_body,"data");
-    if(!data||*data!='['){ printf("[Worker] feed %s: bad response\n",kind); fflush(stdout); free(raw); return; }
+    int st=0;
+    char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
+    if(!body||st<200||st>=300){ printf("[Worker] feed %s: request failed (http %d)\n",kind,st); fflush(stdout); if(body) free(body); return; }
+    const char*data=find_key(body,"data");
+    if(!data||*data!='['){ printf("[Worker] feed %s: bad response\n",kind); fflush(stdout); free(body); return; }
 
     int fi=fidx(kind);
     /* collect run ids in order (parsed in place, no copy of the whole feed) */
@@ -342,7 +352,7 @@ static void process_feed(const char*status,const char*kind){
     }
     if(g_test_once && nids>0){ notify_run(kind,objs[0],ids[0]); g_test_once=false; }
 
-    free(raw);
+    free(body);
     state_save_file();
 }
 

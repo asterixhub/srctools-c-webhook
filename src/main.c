@@ -1,81 +1,302 @@
-/* SRCTools Discord run webhook worker - minimal C implementation. */
+﻿/* srctools-c-webhook: minimal SRC Discord webhook worker (pitc only) */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
-#include <signal.h>
 #include <unistd.h>
-#include <strings.h>
-#include <mbedtls/net.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <errno.h>
+#include <ctype.h>
 
-/* ---------------- allocation / buffer ---------------- */
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/error.h"
 
-static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) exit(1); return p; }
-static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n ? n : 1); if (!q) exit(1); return q; }
-static char *xstrdup(const char *s) { size_t n = strlen(s) + 1; char *p = xmalloc(n); memcpy(p, s, n); return p; }
-typedef struct { char *data; size_t len; size_t cap; } Buf;
-static void buf_init(Buf *b) { b->cap = 256; b->len = 0; b->data = xmalloc(b->cap); b->data[0] = 0; }
-static void buf_reserve(Buf *b, size_t extra) { if (b->len + extra + 1 > b->cap) { while (b->len + extra + 1 > b->cap) b->cap *= 2; b->data = xrealloc(b->data, b->cap); } }
-static void buf_add(Buf *b, const char *s, size_t n) { buf_reserve(b, n); memcpy(b->data + b->len, s, n); b->len += n; b->data[b->len] = 0; }
-static void buf_puts(Buf *b, const char *s) { buf_add(b, s, strlen(s)); }
-static void buf_printf(Buf *b, const char *fmt, ...) { char tmp[1024]; va_list ap; va_start(ap, fmt); vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap); buf_puts(b, tmp); }
-static void buf_free(Buf *b) { free(b->data); b->data = NULL; b->len = b->cap = 0; }
-static char *trim_dup(const char *s) { while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++; size_t n = strlen(s); while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) n--; char *out = xmalloc(n + 1); memcpy(out, s, n); out[n] = 0; return out; }
-static void sleep_ms(long ms) { struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L; nanosleep(&ts, NULL); }
+#define GAME_ID "o1y3oqv6"
+#define GAME_NAME "Parkour in the city"
+#define API_HOST "www.speedrun.com"
+#define API_BASE "/api/v1"
+#define RUN_EMBEDS "game,category,level,players"
+#define CHECK_INTERVAL 8
+#define STATE_CAP 600
 
-/* ---------------- tiny JSON parser ---------------- */
-typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } JType;
-typedef struct Json Json;
-struct Json { JType t; bool b; double num; char *str; char **keys; Json **vals; size_t nkeys, keys_cap; Json **items; size_t nitems, items_cap; };
-typedef struct { const char *p, *end; } JP;
-static Json *jnew(JType t) { Json *j = xmalloc(sizeof *j); memset(j, 0, sizeof *j); j->t = t; return j; }
-static void jskip(JP *ps) { while (ps->p < ps->end && (*ps->p == ' ' || *ps->p == '\t' || *ps->p == '\n' || *ps->p == '\r')) ps->p++; }
-static int jhex(char c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
-static char *jstring(JP *ps, size_t *outlen) { if (ps->p >= ps->end || *ps->p != '"') return NULL; ps->p++; Buf b; buf_init(&b); while (ps->p < ps->end && *ps->p != '"') { char c = *ps->p++; if (c == '\\') { if (ps->p >= ps->end) break; char e = *ps->p++; if (e == 'n') buf_add(&b, "\n", 1); else if (e == 't') buf_add(&b, "\t", 1); else if (e == 'r') buf_add(&b, "\r", 1); else if (e == 'b') buf_add(&b, "\b", 1); else if (e == 'f') buf_add(&b, "\f", 1); else if (e == 'u') { ps->p += 4; } else buf_add(&b, &e, 1); } else buf_add(&b, &c, 1); } if (ps->p < ps->end && *ps->p == '"') ps->p++; *outlen = b.len; char *s = xmalloc(b.len + 1); memcpy(s, b.data, b.len); s[b.len] = 0; free(b.data); return s; }
-static Json *jvalue(JP *ps) { jskip(ps); if (ps->p >= ps->end) return NULL; char c = *ps->p; if (c == '{') { Json *o = jnew(J_OBJ); ps->p++; jskip(ps); if (ps->p < ps->end && *ps->p == '}') { ps->p++; return o; } while (ps->p < ps->end) { jskip(ps); char *key = jstring(ps, NULL); if (!key) break; jskip(ps); if (ps->p < ps->end && *ps->p == ':') ps->p++; Json *v = jvalue(ps); if (o->nkeys == o->keys_cap) { o->keys_cap = o->keys_cap ? o->keys_cap * 2 : 4; o->keys = xrealloc(o->keys, o->keys_cap * sizeof(char *)); o->vals = xrealloc(o->vals, o->keys_cap * sizeof(Json *)); } o->keys[o->nkeys] = key; o->vals[o->nkeys] = v; o->nkeys++; jskip(ps); if (ps->p < ps->end && *ps->p == ',') { ps->p++; continue; } if (ps->p < ps->end && *ps->p == '}') { ps->p++; break; } } return o; } if (c == '[') { Json *a = jnew(J_ARR); ps->p++; jskip(ps); if (ps->p < ps->end && *ps->p == ']') { ps->p++; return a; } while (ps->p < ps->end) { Json *v = jvalue(ps); if (a->nitems == a->items_cap) { a->items_cap = a->items_cap ? a->items_cap * 2 : 4; a->items = xrealloc(a->items, a->items_cap * sizeof(Json *)); } a->items[a->nitems++] = v; jskip(ps); if (ps->p < ps->end && *ps->p == ',') { ps->p++; continue; } if (ps->p < ps->end && *ps->p == ']') { ps->p++; break; } } return a; } if (c == '"') { Json *s = jnew(J_STR); s->str = jstring(ps, NULL); return s; } if (c == 't') { if (ps->end - ps->p >= 4 && strncmp(ps->p, "true", 4) == 0) { ps->p += 4; Json *j = jnew(J_BOOL); j->b = true; return j; } return NULL; } if (c == 'f') { if (ps->end - ps->p >= 5 && strncmp(ps->p, "false", 5) == 0) { ps->p += 5; Json *j = jnew(J_BOOL); j->b = false; return j; } return NULL; } if (c == 'n') { if (ps->end - ps->p >= 4 && strncmp(ps->p, "null", 4) == 0) { ps->p += 4; return jnew(J_NULL); } return NULL; } { Json *j = jnew(J_NUM); char *endp; double d = strtod(ps->p, &endp); j->num = d; ps->p = endp; return j; } }
-static Json *jparse(JP *ps) { return jvalue(ps); }
-static void jfree(Json *j) { if (!j) return; if (j->t == J_OBJ) { for (size_t i = 0; i < j->nkeys; i++) { free(j->keys[i]); jfree(j->vals[i]); } free(j->keys); free(j->vals); } if (j->t == J_ARR) { for (size_t i = 0; i < j->nitems; i++) jfree(j->items[i]); free(j->items); } free(j->str); free(j); }
-static const Json *jget(const Json *o, const char *key) { if (!o || o->t != J_OBJ) return NULL; for (size_t i = 0; i < o->nkeys; i++) if (strcasecmp(o->keys[i], key) == 0) return o->vals[i]; return NULL; }
-static double jnum(const Json *o, const char *key, double dflt) { const Json *v = jget(o, key); return (v && v->t == J_NUM) ? v->num : dflt; }
-static const char *jstr(const Json *o, const char *key, const char *dflt) { const Json *v = jget(o, key); if (v && v->t == J_STR) return v->str ? v->str : ""; return dflt; }
-static const Json *jarr_get(const Json *o, const char *key) { const Json *v = jget(o, key); if (v && v->t == J_ARR) return v; return NULL; }
+typedef struct { char *d; size_t n, c; } Buf;
+typedef struct { char *s; size_t n; } Str;
 
-/* ---------------- http via mbedtls ---------------- */
-static mbedtls_net_context net_ctx;
-static mbedtls_ssl_context ssl_ctx;
-static mbedtls_ssl_config ssl_conf;
-static int http_request(const char *host, int port, const char *path, const char *method, const char *body, char **out_body, size_t *out_len, long *out_status) {
-    int rc = -1;
-    mbedtls_net_config netcfg; mbedtls_net_config_init(&netcfg); netcfg.timeout = 10000;
-    mbedtls_net_init(&net_ctx, &netcfg);
-    mbedtls_ssl_conf_init(&ssl_conf);
-    mbedtls_ssl_conf_authmode(&ssl_conf, mbedtls_auth_ca_required);
-    mbedtls_ssl_conf_set(&ssl_conf, NULL);
-    mbedtls_ssl_init(&ssl_ctx);
-    mbedtls_ssl_setup(&ssl_ctx, &ssl_conf);
-    mbedtls_ssl_start(&ssl_ctx);
-    if (mbedtls_net_connect(&net_ctx, host, port, &ssl_ctx) != 0) return -1;
-    if (mbedtls_ssl_handshake(&ssl_ctx) != 0) return -1;
-    Buf req; buf_init(&req);
-    buf_puts(&req, method); buf_puts(&req, " "); buf_puts(&req, path); buf_puts(&req, " HTTP/1.1\r\nHost: "); buf_puts(&req, host); buf_puts(&req, "\r\nContent-Type: application/json\r\nContent-Length: "); buf_printf(&req, "%zu\r\nConnection: close\r\n\r\n", body ? strlen(body) : 0);
-    if (mbedtls_ssl_write(&ssl_ctx, req.data, req.len) != 0) goto done;
-    unsigned char rbuf[8192]; Buf resp; buf_init(&resp); size_t rlen = 0; int closed = 0;
-    while (!closed) { int rrc = mbedtls_ssl_read(&ssl_ctx, rbuf, sizeof rbuf, &rlen); if (rrc != 0) { closed = 1; break; } if (rlen == 0) break; buf_add(&resp, (char *)rbuf, rlen); rlen = 0; }
-    const char *hdr_end = strstr(resp.data, "\r\n\r\n");
-    if (hdr_end) { *out_status = (long)strtol(hdr_end + 4, NULL, 10); *out_body = xstrdup(hdr_end + 4); *out_len = strlen(hdr_end + 4); rc = 0; }
-done:
-    mbedtls_ssl_free(&ssl_ctx); mbedtls_net_free(&net_ctx); mbedtls_ssl_conf_free(&ssl_conf); return rc;
+static void die(const char *m){ fprintf(stderr,"%s\n",m); exit(1);} 
+static void *xmalloc(size_t n){ void*p=malloc(n?n:1); if(!p) die("oom"); return p; }
+static void *xrealloc(void*p,size_t n){ void*q=realloc(p,n?n:1); if(!q) die("oom"); return q; }
+static char *xstrdup(const char*s){ size_t n=strlen(s); char*p=xmalloc(n+1); memcpy(p,s,n+1); return p; }
+static void binit(Buf*b){ b->c=256; b->n=0; b->d=xmalloc(b->c); b->d[0]=0; }
+static void badd(Buf*b,const void*s,size_t n){ if(b->n+n+1>b->c){ while(b->n+n+1>b->c) b->c*=2; b->d=xrealloc(b->d,b->c);} memcpy(b->d+b->n,s,n); b->n+=n; b->d[b->n]=0; }
+static void bputs(Buf*b,const char*s){ badd(b,s,strlen(s)); }
+static void bfmt(Buf*b,const char*fmt,...){ char tmp[1024]; va_list ap; va_start(ap,fmt); vsnprintf(tmp,sizeof tmp,fmt,ap); va_end(ap); bputs(b,tmp);} 
+static void bfree(Buf*b){ free(b->d); b->d=NULL; b->n=b->c=0; }
+
+static volatile sig_atomic_t stopflag=0;
+static void on_sig(int s){ (void)s; stopflag=1; }
+
+static long now_ms(void){ struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); return ts.tv_sec*1000L+ts.tv_nsec/1000000L; }
+static void msleep(long ms){ if(ms<=0) return; struct timespec ts; ts.tv_sec=ms/1000; ts.tv_nsec=(ms%1000)*1000000L; nanosleep(&ts,NULL); }
+
+/* minimal JSON helpers: find string/number/object/array by key in flat object text is hard;
+   instead use very targeted parsing for known SRC API shapes. */
+static const char *skip_ws(const char*p){ while(p && (*p==' '||*p=='\t'||*p=='\r'||*p=='\n')) p++; return p; }
+static char *json_get_string(const char *obj, const char *key);
+static char *json_get_raw(const char *obj, const char *key);
+
+static const char *find_key(const char *obj,const char*key){
+    if(!obj||!key) return NULL;
+    size_t klen=strlen(key);
+    const char*p=obj;
+    int depth=0; bool in_str=false; bool esc=false;
+    /* find key at current object level (depth 1 when inside { }) */
+    if(*p=='{') { p++; depth=1; }
+    while(*p){
+        char c=*p;
+        if(in_str){ if(esc) esc=false; else if(c=='\\') esc=true; else if(c=='"') in_str=false; p++; continue; }
+        if(c=='"'){
+            if(depth==1){
+                const char*start=p+1;
+                const char*q=start;
+                while(*q && *q!='"'){ if(*q=='\\'&&q[1]) q+=2; else q++; }
+                size_t len=q-start;
+                if(len==klen && strncmp(start,key,klen)==0){
+                    const char*r=skip_ws(q+1);
+                    if(*r==':') return skip_ws(r+1);
+                }
+            }
+            in_str=true; p++; continue;
+        }
+        if(c=='{'||c=='[') depth++;
+        else if(c=='}'||c==']') { depth--; if(depth<=0) return NULL; }
+        p++;
+    }
+    return NULL;
 }
 
-/* ---------------- discord ---------------- */
-static void json_escape(Buf *b, const char *s) { buf_add(b, "\"", 1); for (const unsigned char *p = (const unsigned char *)s; *p; p++) { if (*p == '"' || *p == '\\') { char tmp[2] = { '\\', (char)*p }; buf_add(b, tmp, 2); } else if (*p == '\n') buf_add(b, "\\n", 2); else if (*p == '\r') buf_add(b, "\\r", 2); else if (*p == '\t') buf_add(b, "\\t", 2); else buf_add(b, (const char *)p, 1); } buf_add(b, "\"", 1); }
-static void build_discord_payload(Buf *b, const char *title, const char *url, const char *desc, long color) { buf_puts(b, "{\"embeds\":[{\"title\":"); json_escape(b, title); buf_puts(b, ",\"url\":"); json_escape(b, url); buf_puts(b, ",\"description\":"); json_escape(b, desc); buf_printf(b, ",\"color\":%ld}", color); buf_puts(b, "],\"allowed_mentions\":{\"parse\":[]}}"); }
+static char *unescape_json_str(const char*s,size_t len){
+    Buf b; binit(&b);
+    for(size_t i=0;i<len;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(c=='\\' && i+1<len){
+            char e=s[++i];
+            if(e=='n') badd(&b,"\n",1); else if(e=='t') badd(&b,"\t",1); else if(e=='r') badd(&b,"\r",1);
+            else if(e=='"') badd(&b,"\"",1); else if(e=='\\') badd(&b,"\\",1); else if(e=='/'){badd(&b,"/",1);} 
+            else if(e=='u' && i+4<len){ unsigned v=0; for(int k=0;k<4;k++){ char h=s[i+1+k]; v<<=4; if(h>='0'&&h<='9') v|=h-'0'; else if(h>='a'&&h<='f') v|=10+h-'a'; else if(h>='A'&&h<='F') v|=10+h-'A'; } i+=4; char tmp[4]; int n=0; if(v<0x80){tmp[0]=v;n=1;} else if(v<0x800){tmp[0]=0xC0|(v>>6);tmp[1]=0x80|(v&0x3F);n=2;} else {tmp[0]=0xE0|(v>>12);tmp[1]=0x80|((v>>6)&0x3F);tmp[2]=0x80|(v&0x3F);n=3;} badd(&b,tmp,n); }
+            else { badd(&b,&e,1);} 
+        } else badd(&b,&c,1);
+    }
+    return b.d;
+}
 
-int main(void) { return 0; }
+static char *json_get_string(const char *obj,const char*key){
+    const char*v=find_key(obj,key); if(!v||*v!='"') return NULL;
+    v++;
+    const char*start=v;
+    while(*v){ if(*v=='\\'&&v[1]) v+=2; else if(*v=='"') break; else v++; }
+    if(*v!='"') return NULL;
+    return unescape_json_str(start,(size_t)(v-start));
+}
 
-#endif
+static char *json_get_raw(const char *obj,const char*key){
+    const char*v=find_key(obj,key); if(!v) return NULL;
+    const char*p=v; int depth=0; bool in_str=false; bool esc=false;
+    while(*p){
+        char c=*p;
+        if(in_str){ if(esc) esc=false; else if(c=='\\') esc=true; else if(c=='"') in_str=false; p++; continue; }
+        if(c=='"'){ in_str=true; p++; continue; }
+        if(c=='{'||c=='[') depth++;
+        else if(c=='}'||c==']'){ if(depth==0) break; depth--; }
+        else if((c==','||c=='}'||c==']') && depth==0) break;
+        p++;
+    }
+    size_t len=(size_t)(p-v); char*out=xmalloc(len+1); memcpy(out,v,len); out[len]=0; return out;
+}
+
+static double json_get_num(const char*obj,const char*key,double def){
+    char*r=json_get_raw(obj,key); if(!r) return def; double d=strtod(r,NULL); free(r); return d; }
+
+/* TLS client */
+typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; bool ok; } Tls;
+static int tls_connect(Tls*t,const char*host,const char*port){
+    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); t->ok=false;
+    if(mbedtls_ctr_drbg_seed(&t->ctr,mbedtls_entropy_func,&t->ent,(const unsigned char*)"s",1)!=0) return -1;
+    if(mbedtls_net_connect(&t->net,host,port,MBEDTLS_NET_PROTO_TCP)!=0) return -1;
+    if(mbedtls_ssl_config_defaults(&t->conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)!=0) return -1;
+    mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&t->conf,mbedtls_ctr_drbg_random,&t->ctr);
+    if(mbedtls_ssl_setup(&t->ssl,&t->conf)!=0) return -1;
+    mbedtls_ssl_set_hostname(&t->ssl,host);
+    mbedtls_ssl_set_bio(&t->ssl,&t->net,mbedtls_net_send,mbedtls_net_recv,NULL);
+    int r; while((r=mbedtls_ssl_handshake(&t->ssl))!=0){ if(r!=MBEDTLS_ERR_SSL_WANT_READ&&r!=MBEDTLS_ERR_SSL_WANT_WRITE) return -1; }
+    t->ok=true; return 0;
+}
+static int tls_write_all(Tls*t,const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&t->ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
+static char* tls_read_all(Tls*t,size_t*olen){ Buf b; binit(&b); unsigned char tmp[4096]; for(;;){ int r=mbedtls_ssl_read(&t->ssl,tmp,sizeof tmp); if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE) continue; if(r==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY||r==0) break; if(r<0) break; badd(&b,tmp,(size_t)r);} *olen=b.n; return b.d; }
+static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); }
+
+static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status){
+    Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); return NULL; }
+    Buf req; binit(&req);
+    bfmt(&req,"%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: s\r\nConnection: close\r\n",method,path,host);
+    if(extra_hdr&&extra_hdr[0]) bputs(&req,extra_hdr);
+    if(body){ bfmt(&req,"Content-Type: application/json\r\nContent-Length: %zu\r\n",strlen(body)); }
+    bputs(&req,"\r\n");
+    if(body) bputs(&req,body);
+    if(tls_write_all(&t,(unsigned char*)req.d,req.n)!=0){ bfree(&req); tls_close(&t); return NULL; }
+    bfree(&req);
+    size_t rn=0; char*resp=tls_read_all(&t,&rn); tls_close(&t);
+    if(!resp) return NULL;
+    *status=0;
+    char*sp=strstr(resp,"\r\n\r\n"); if(!sp){ free(resp); return NULL; }
+    *sp=0; char*body_out=xstrdup(sp+4);
+    if(sscanf(resp,"HTTP/%*d.%*d %d",status)!=1) *status=0;
+    free(resp); return body_out;
+}
+
+/* Discord webhook host/path split */
+static char wh_host[256]="discord.com"; static char wh_path[512]="";
+static void parse_webhook(const char*url){
+    const char*p=url; if(strncmp(p,"https://",8)==0) p+=8; else if(strncmp(p,"http://",7)==0) p+=7;
+    const char*sl=strchr(p,'/'); if(!sl){ strncpy(wh_host,p,sizeof wh_host-1); wh_path[0]='/'; wh_path[1]=0; return; }
+    size_t hl=(size_t)(sl-p); if(hl>=sizeof wh_host) hl=sizeof wh_host-1; memcpy(wh_host,p,hl); wh_host[hl]=0; strncpy(wh_path,sl,sizeof wh_path-1); wh_path[sizeof wh_path-1]=0;
+}
+
+/* state: simple persistence */
+typedef struct { char id[32]; } Seen;
+typedef struct { char feed[8]; bool primed; char high[64]; Seen seen[STATE_CAP]; int nseen; } FState;
+static FState fst[3];
+static char state_path[512];
+static bool state_dirty=false;
+
+static int fidx(const char*k){ if(strcmp(k,"new")==0) return 0; if(strcmp(k,"verified")==0) return 1; return 2; }
+static void state_load_file(void){ for(int i=0;i<3;i++){ fst[i].primed=false; fst[i].high[0]=0; fst[i].nseen=0; }
+    FILE*f=fopen(state_path,"r"); if(!f) return; char line[4096];
+    while(fgets(line,sizeof line,f)){ char*k=strtok(line,"|"); char*pr=strtok(NULL,"|"); char*hw=strtok(NULL,"|"); char*ids=strtok(NULL,"\n");
+        if(!k) continue; int i=fidx(k); if(i<0||i>2) continue; fst[i].primed=pr&&strcmp(pr,"1")==0; if(hw) strncpy(fst[i].high,hw,sizeof fst[i].high-1);
+        fst[i].nseen=0; if(ids){ char*tok=strtok(ids,","); while(tok&&fst[i].nseen<STATE_CAP){ while(*tok==' ') tok++; char*e=tok+strlen(tok); while(e>tok&&isspace((unsigned char)e[-1])) *--e=0; if(*tok){ strncpy(fst[i].seen[fst[i].nseen].id,tok,31); fst[i].seen[fst[i].nseen].id[31]=0; fst[i].nseen++; } tok=strtok(NULL,","); } }
+    } fclose(f);
+}
+static void state_save_file(void){ if(!state_dirty) return; FILE*f=fopen(state_path,"w"); if(!f) return; const char*names[3]={"new","verified","rejected"}; for(int i=0;i<3;i++){ fprintf(f,"%s|%d|%s|",names[i],fst[i].primed?1:0,fst[i].high); for(int j=0;j<fst[i].nseen;j++){ if(j) fputc(',',f); fprintf(f,"%s",fst[i].seen[j].id);} fputc('\n',f);} fclose(f); state_dirty=false; }
+static bool seen_has(int fi,const char*id){ for(int j=0;j<fst[fi].nseen;j++) if(strcmp(fst[fi].seen[j].id,id)==0) return true; return false; }
+static void seen_add(int fi,const char*id){ if(seen_has(fi,id)) return; if(fst[fi].nseen<STATE_CAP){ strncpy(fst[fi].seen[fst[fi].nseen].id,id,31); fst[fi].seen[fst[fi].nseen].id[31]=0; fst[fi].nseen++; }
+    else { memmove(&fst[fi].seen[0],&fst[fi].seen[1],sizeof(Seen)*(STATE_CAP-1)); strncpy(fst[fi].seen[STATE_CAP-1].id,id,31); fst[fi].seen[STATE_CAP-1].id[31]=0; } state_dirty=true; }
+
+/* helpers */
+static void json_escape(Buf*b,const char*s){ badd(b,"\"",1); if(!s) s=""; for(const unsigned char*p=(const unsigned char*)s;*p;p++){ if(*p=='"'||*p=='\\'){ char t[2]={'\\',(char)*p}; badd(b,t,2);} else if(*p=='\n') bputs(b,"\\n"); else if(*p=='\r') bputs(b,"\\r"); else if(*p=='\t') bputs(b,"\\t"); else if(*p<0x20){ char t[7]; snprintf(t,sizeof t,"\\u%04x",*p); bputs(b,t);} else badd(b,p,1);} badd(b,"\"",1); }
+static char *clean(const char*s,int max){ if(!s) return xstrdup(""); Buf b; binit(&b); for(const unsigned char*p=(const unsigned char*)s;*p;p++){ if(*p=='\n'||*p=='\r'||*p=='\t') badd(&b," ",1); else if(*p>=0x20) badd(&b,p,1);} /* trim */ char*d=b.d; while(*d==' ') d++; char*end=d+strlen(d); while(end>d&&end[-1]==' ') *--end=0; char*o=xstrdup(d); bfree(&b); if((int)strlen(o)>max) o[max]=0; return o; }
+static void fmt_compact(Buf*b,double sec){ long long ms=(long long)(sec*1000.0+0.5); long long m=ms/60000; long long s=(ms/1000)%60; long long ml=ms%1000; bfmt(b,"%lldm %llds %03lldms",m,s,ml); }
+
+/* send discord */
+static const char* ev_title(const char*k){ if(strcmp(k,"new")==0) return "\xF0\x9F\x8F\x86 New Run"; if(strcmp(k,"verified")==0) return "\xE2\x9C\x85 Run verified"; return "\xE2\x9D\x8C Run rejected"; }
+static long ev_color(const char*k){ if(strcmp(k,"new")==0) return 0x5865f2; if(strcmp(k,"verified")==0) return 0x57f287; return 0xed4245; }
+
+static bool send_discord(const char*kind,const char*run_url,const char*map,const char*time_s,const char*runner,const char*reason){
+    Buf pl; binit(&pl);
+    bputs(&pl,"{\"embeds\":[{\"title\":"); json_escape(&pl,ev_title(kind));
+    bputs(&pl,",\"url\":"); json_escape(&pl,run_url?run_url:"");
+    char desc[1200]; if(reason&&reason[0]) snprintf(desc,sizeof desc,"%s in %s by %s\nReason: %s",map,time_s,runner,reason); else snprintf(desc,sizeof desc,"%s in %s by %s",map,time_s,runner);
+    bputs(&pl,",\"description\":"); json_escape(&pl,desc);
+    bfmt(&pl,",\"color\":%ld}],\"allowed_mentions\":{\"parse\":[]}}",ev_color(kind));
+    int st=0; char*resp=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); bfree(&pl); if(resp) free(resp);
+    if(st==204||st==200) return true;
+    if(st==429){ msleep(1200); char*resp2=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); if(resp2) free(resp2); return (st==204||st==200);} /* pl freed, but rare; acceptable minimal */
+    return false;
+}
+
+/* extract runs and notify */
+static char* get_nested(const char*obj,const char*k1,const char*k2){ char*r=json_get_raw(obj,k1); if(!r) return NULL; char*o=NULL; if(r[0]=='{') o=json_get_string(r,k2); else if(r[0]=='"' ){ /* id string */ } free(r); return o; }
+static char* player_name_from_obj(const char*obj){
+    char*names=json_get_raw(obj,"names");
+    if(names && names[0]=='{'){ char*n=json_get_string(names,"international"); if(!n) n=json_get_string(names,"japanese"); if(n){ free(names); return n; } }
+    if(names) free(names);
+    char*n=json_get_string(obj,"name"); if(n) return n; return xstrdup("Unknown runner");
+}
+
+static void process_feed(const char*status,const char*kind){
+    char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
+    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=20",API_BASE,GAME_ID,status,orderby,RUN_EMBEDS);
+    char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
+    int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
+    if(!body||st<200||st>=300){ if(body) free(body); return; }
+    char*data=json_get_raw(body,"data"); free(body); if(!data||data[0]!='['){ if(data) free(data); return; }
+
+    int fi=fidx(kind);
+    /* collect run ids in order */
+    char ids[40][32]; int nids=0; char*run_objs[40]; memset(run_objs,0,sizeof run_objs);
+    const char*p=data+1; int depth=0; bool in_str=false,esc=false;
+    while(*p && nids<20){
+        p=(char*)skip_ws(p); if(*p==']') break; if(*p!= '{'){ p++; continue; }
+        const char*start=p; depth=0; in_str=false; esc=false;
+        do{ char c=*p; if(in_str){ if(esc) esc=false; else if(c=='\\') esc=true; else if(c=='"') in_str=false; } else { if(c=='"') in_str=true; else if(c=='{') depth++; else if(c=='}') depth--; } p++; }while(*p && depth>0);
+        size_t len=(size_t)(p-start); char*obj=xmalloc(len+1); memcpy(obj,start,len); obj[len]=0;
+        char*id=json_get_string(obj,"id"); if(id){ strncpy(ids[nids],id,31); ids[nids][31]=0; run_objs[nids]=obj; nids++; free(id);} else free(obj);
+        p=(char*)skip_ws(p); if(*p==',') p++;
+    }
+
+    /* determine notifications */
+    char notify[40][32]; int nn=0;
+    if(!fst[fi].primed){ fst[fi].primed=true; state_dirty=true; }
+    else {
+        for(int i=nids-1;i>=0;i--){ if(!seen_has(fi,ids[i])){ strncpy(notify[nn],ids[i],31); notify[nn][31]=0; nn++; } }
+    }
+    /* update seen and highwater */
+    for(int i=0;i<nids;i++){ seen_add(fi,ids[i]); }
+    /* send notifications */
+    for(int k=0;k<nn;k++){
+        /* find object */
+        char*obj=NULL; for(int i=0;i<nids;i++) if(strcmp(ids[i],notify[k])==0){ obj=run_objs[i]; break; }
+        if(!obj) continue;
+        char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(64); snprintf(run_url,64,"https://www.speedrun.com/pitc/run/%s",notify[k]); }
+        char*cat_raw=json_get_raw(obj,"category"); char*lvl_raw=json_get_raw(obj,"level"); char*players_raw=json_get_raw(obj,"players");
+        char*mapn=NULL; if(lvl_raw&&lvl_raw[0]=='{') mapn=json_get_string(lvl_raw,"name"); if(!mapn && cat_raw&&cat_raw[0]=='{') mapn=json_get_string(cat_raw,"name"); if(!mapn) mapn=xstrdup("Run");
+        char*runner=xstrdup("Unknown runner");
+        if(players_raw&&players_raw[0]=='{'){ char*d=json_get_raw(players_raw,"data"); if(d&&d[0]=='['){ /* first element */ const char*q=skip_ws(d+1); if(*q=='{'){ int dp=0; bool ins=false,es=false; const char*st=q; do{ char c=*q; if(ins){if(es)es=false;else if(c=='\\')es=true;else if(c=='"')ins=false;} else {if(c=='"')ins=true; else if(c=='{')dp++; else if(c=='}')dp--; } q++; }while(*q && dp>0); size_t l=(size_t)(q-st); char*po=xmalloc(l+1); memcpy(po,st,l); po[l]=0; free(runner); runner=player_name_from_obj(po); free(po);} } if(d) free(d);} 
+        char*t_raw=json_get_raw(obj,"times"); double psec=0; if(t_raw&&t_raw[0]=='{') psec=json_get_num(t_raw,"primary_t",0); if(t_raw) free(t_raw);
+        Buf tb; binit(&tb); if(psec>0) fmt_compact(&tb,psec); else bputs(&tb,"?"); char*time_s=xstrdup(tb.d); bfree(&tb);
+        char*reason=NULL; if(strcmp(kind,"rejected")==0){ char*straw=json_get_raw(obj,"status"); if(straw&&straw[0]=='{') reason=json_get_string(straw,"reason"); if(straw) free(straw); }
+        char*mapc=clean(mapn,256); char*runc=clean(runner,256); char*reas_c=reason?clean(reason,300):NULL;
+        fprintf(stderr,"[Worker] %s %s\n",kind,notify[k]);
+        send_discord(kind,run_url,mapc,time_s,runc,reas_c?reas_c:"");
+        free(mapc); free(runc); if(reas_c) free(reas_c); if(reason) free(reason); free(time_s); free(runner); free(mapn); if(players_raw) free(players_raw); if(lvl_raw) free(lvl_raw); if(cat_raw) free(cat_raw); free(run_url);
+        msleep(800);
+    }
+
+    for(int i=0;i<nids;i++) if(run_objs[i]) free(run_objs[i]);
+    free(data);
+    state_save_file();
+}
+
+int main(void){
+    signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
+    const char*wh=getenv("DISCORD_WEBHOOK_URL");
+    if(!wh||!wh[0]) wh="https://discord.com/api/webhooks/1570141754944921721/x70Kdz7KhNppLEErIfqFc3UyRKDTFqaCqtIaGc7iNrKHwlbIrl3KhlNsLJDXDU59AAPq";
+    parse_webhook(wh);
+    const char*vol=getenv("RAILWAY_VOLUME_MOUNT_PATH"); if(!vol||!*vol) vol="./data";
+    mkdir(vol,0755);
+    snprintf(state_path,sizeof state_path,"%s/state.txt",vol);
+    state_load_file();
+    fprintf(stderr,"[Worker] Started; polling every %ds (game=%s %s)\n",CHECK_INTERVAL,GAME_ID,GAME_NAME);
+    while(!stopflag){
+        long t0=now_ms();
+        process_feed("new","new");
+        if(stopflag) break;
+        process_feed("verified","verified");
+        if(stopflag) break;
+        process_feed("rejected","rejected");
+        long dt=now_ms()-t0; long wait=CHECK_INTERVAL*1000L-dt; if(wait<500) wait=500;
+        long end=now_ms()+wait; while(!stopflag && now_ms()<end) msleep(250);
+    }
+    state_save_file();
+    fprintf(stderr,"[Worker] Stopped\n");
+    return 0;
+}

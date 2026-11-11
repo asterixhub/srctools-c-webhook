@@ -174,7 +174,8 @@ static bool tls_setup(void){
     else mbedtls_ssl_conf_authmode(&g_conf,MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&g_conf,mbedtls_ctr_drbg_random,&g_ctr);
     if(mbedtls_ssl_setup(&g_ssl,&g_conf)!=0) return false;
-    g_tls_ready=true; return true;
+    g_tls_ready=true; log_rss("tls-init");
+    return true;
 }
 
 static int bio_send(void *ctx,const unsigned char*buf,size_t len){ return mbedtls_net_send(ctx,buf,len); }

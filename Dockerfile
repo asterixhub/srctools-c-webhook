@@ -12,7 +12,7 @@ RUN cd mbedtls && make -j4 lib CFLAGS="-O2" \
  && ls -l /worker
 
 FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /worker /worker
 ENV RAILWAY_VOLUME_MOUNT_PATH=/data
 ENTRYPOINT ["/worker"]

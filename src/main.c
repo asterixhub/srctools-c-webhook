@@ -241,6 +241,13 @@ static bool send_discord(const char*kind,const char*run_url,const char*map,const
 }
 
 /* extract runs and notify */
+static char* json_embedded_string(const char*obj,const char*key){
+    if(!obj) return NULL;
+    const char*d=find_key(obj,"data");
+    if(d&&*d=='{') return json_get_string(d,key);
+    return NULL;
+}
+
 static char* player_name_from_obj(const char*obj){
     char*names=json_get_raw(obj,"names");
     if(names && names[0]=='{'){ char*n=json_get_string(names,"international"); if(!n) n=json_get_string(names,"japanese"); if(n){ free(names); return n; } }
@@ -289,7 +296,7 @@ static void process_feed(const char*status,const char*kind){
         if(!obj) continue;
         char*run_url=json_get_string(obj,"weblink"); if(!run_url){ run_url=xmalloc(96); snprintf(run_url,96,"https://www.speedrun.com/pitc/runs/%s",notify[k]); }
         char*cat_raw=json_get_raw(obj,"category"); char*lvl_raw=json_get_raw(obj,"level"); char*players_raw=json_get_raw(obj,"players");
-        char*mapn=NULL; if(lvl_raw&&lvl_raw[0]=='{') mapn=json_get_string(lvl_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn && cat_raw&&cat_raw[0]=='{') mapn=json_get_string(cat_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn) mapn=xstrdup("Run");
+        char*mapn=NULL; if(lvl_raw) mapn=json_embedded_string(lvl_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn && cat_raw) mapn=json_embedded_string(cat_raw,"name"); if(mapn&&!mapn[0]){ free(mapn); mapn=NULL; } if(!mapn) mapn=xstrdup("Unknown map");
         char*runner=xstrdup("Unknown runner");
         if(players_raw&&players_raw[0]=='{'){ char*d=json_get_raw(players_raw,"data"); if(d&&d[0]=='['){ /* first element */ const char*q=skip_ws(d+1); if(*q=='{'){ int dp=0; bool ins=false,es=false; const char*st=q; do{ char c=*q; if(ins){if(es)es=false;else if(c=='\\')es=true;else if(c=='"')ins=false;} else {if(c=='"')ins=true; else if(c=='{')dp++; else if(c=='}')dp--; } q++; }while(*q && dp>0); size_t l=(size_t)(q-st); char*po=xmalloc(l+1); memcpy(po,st,l); po[l]=0; free(runner); runner=player_name_from_obj(po); free(po);} } if(d) free(d);} 
         char*t_raw=json_get_raw(obj,"times"); double psec=0; if(t_raw&&t_raw[0]=='{') psec=json_get_num(t_raw,"primary_t",0); if(t_raw) free(t_raw);

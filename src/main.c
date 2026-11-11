@@ -126,7 +126,15 @@ static char *json_get_raw(const char *obj,const char*key){
 static double json_get_num(const char*obj,const char*key,double def){
     char*r=json_get_raw(obj,key); if(!r) return def; double d=strtod(r,NULL); free(r); return d; }
 
-/* TLS client */
+/* ---------------- config ---------------- */
+
+static int interval_sec = CHECK_INTERVAL;
+static const char *game_id = GAME_ID;
+static bool use_new = true, use_verified = true, use_rejected = true;
+
+static char *trim_dup(const char *s){ while(*s==' '||*s=='\t'||*s=='\r'||*s=='\n') s++; size_t n=strlen(s); while(n>0&&(s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) n--; char*o=xmalloc(n+1); memcpy(o,s,n); o[n]=0; return o; }
+
+/* ---------------- TLS client ---------------- */
 typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; mbedtls_x509_crt cacrt; bool ok; } Tls;
 static int tls_connect(Tls*t,const char*host,const char*port){
     mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); mbedtls_x509_crt_init(&t->cacrt); t->ok=false;
@@ -237,7 +245,7 @@ static char* player_name_from_obj(const char*obj){
 
 static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
-    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=20",API_BASE,GAME_ID,status,orderby,RUN_EMBEDS);
+    snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=20",API_BASE,game_id,status,orderby,RUN_EMBEDS);
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
     int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
     if(!body||st<200||st>=300){ if(body) free(body); return; }
@@ -295,25 +303,28 @@ static void process_feed(const char*status,const char*kind){
 int main(void){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
     setvbuf(stdout,NULL,_IOLBF,0);
+    const char*iv=getenv("CHECK_INTERVAL_SECONDS"); if(iv&&*iv){ int v=atoi(iv); if(v>=1&&v<=3600) interval_sec=v; }
+    const char*gv=getenv("MONITORED_GAME_IDS"); if(gv&&*gv){ char*tmp=xstrdup(gv); char*comma=strchr(tmp,','); if(comma) *comma=0; char*t=trim_dup(tmp); if(t[0]) game_id=t; free(tmp); }
+    { const char*ev=getenv("MONITORED_EVENTS"); if(ev&&*ev){ use_new=use_verified=use_rejected=false; char*tmp=xstrdup(ev); char*save=NULL; char*tok=strtok_r(tmp,",",&save); while(tok){ char low[64]; snprintf(low,sizeof low,"%s",tok); for(char*q=low;*q;q++) if(*q>='A'&&*q<='Z') *q=(char)(*q-'A'+'a'); if(!strcmp(low,"new")||!strcmp(low,"newrun")) use_new=true; else if(!strcmp(low,"verified")||!strcmp(low,"approved")) use_verified=true; else if(!strcmp(low,"rejected")) use_rejected=true; tok=strtok_r(NULL,",",&save); } free(tmp); } }
     const char*wh=getenv("DISCORD_WEBHOOK_URL");
-    if(!wh||!wh[0]) wh="https://discord.com/api/webhooks/1570141754944921721/x70Kdz7KhNppLEErIfqFc3UyRKDTFqaCqtIaGc7iNrKHwlbIrl3KhlNsLJDXDU59AAPq";
+    if(!wh||!wh[0]){ printf("[Config] DISCORD_WEBHOOK_URL is required\n"); fflush(stdout); return 1; }
     parse_webhook(wh);
     const char*vol=getenv("RAILWAY_VOLUME_MOUNT_PATH"); if(!vol||!*vol) vol="./data";
     mkdir(vol,0755);
     snprintf(state_path,sizeof state_path,"%s/state.txt",vol);
     const char*reset=getenv("RESET_STATE");
     if(!(reset&&strcmp(reset,"1")==0)) state_load_file();
-    printf("[Worker] Started; polling every %ds (game=%s %s)\n",CHECK_INTERVAL,GAME_ID,GAME_NAME); fflush(stdout);
+    printf("[Worker] Started; polling every %ds (game=%s %s)\n",interval_sec,game_id,GAME_NAME); fflush(stdout);
     const char*test=getenv("TEST_NOTIFY");
     if(test&&strcmp(test,"1")==0){ bool ok=send_discord("new","https://www.speedrun.com/pitc","Parkour in the city","0m 12s 345ms","Test runner",""); printf("[Worker] Test notification: %s\n",ok?"sent":"failed"); fflush(stdout); }
     while(!stopflag){
         long t0=now_ms();
-        process_feed("new","new");
+        if(use_new) process_feed("new","new");
         if(stopflag) break;
-        process_feed("verified","verified");
+        if(use_verified) process_feed("verified","verified");
         if(stopflag) break;
-        process_feed("rejected","rejected");
-        long dt=now_ms()-t0; long wait=CHECK_INTERVAL*1000L-dt; if(wait<500) wait=500;
+        if(use_rejected) process_feed("rejected","rejected");
+        long dt=now_ms()-t0; long wait=interval_sec*1000L-dt; if(wait<500) wait=500;
         long end=now_ms()+wait; while(!stopflag && now_ms()<end) msleep(250);
     }
     state_save_file();

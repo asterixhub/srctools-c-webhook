@@ -8,7 +8,7 @@ COPY mbedtls_config.h /src/mbedtls/include/mbedtls/mbedtls_config.h
 COPY src/main.c /src/main.c
 RUN cd mbedtls && make -j4 lib CFLAGS="-O2" \
  && cd /src && gcc -O2 -s -static -I mbedtls/include -o /worker main.c \
-    mbedtls/library/libmbedcrypto.a mbedtls/library/libmbedx509.a mbedtls/library/libmbedtls.a \
+    mbedtls/library/libmbedtls.a mbedtls/library/libmbedx509.a mbedtls/library/libmbedcrypto.a \
  && ls -l /worker
 
 FROM scratch

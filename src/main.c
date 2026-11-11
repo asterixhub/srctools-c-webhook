@@ -154,6 +154,15 @@ static bool g_tls_ready = false;
 static char g_feed_buf[FEED_BUF_SIZE];
 static char g_dsc_buf[DSC_BUF_SIZE];
 
+static void log_rss(const char*tag){
+    FILE*f=fopen("/proc/self/statm","r");
+    if(!f) return;
+    unsigned long size=0,resident=0;
+    if(fscanf(f,"%lu %lu",&size,&resident)!=2){ fclose(f); return; }
+    fclose(f);
+    printf("[mem] %s: rss=%lu KB\n",tag,resident*4); fflush(stdout);
+}
+
 static bool tls_setup(void){
     if(g_tls_ready) return true;
     mbedtls_net_init(&g_net); mbedtls_ssl_init(&g_ssl); mbedtls_ssl_config_init(&g_conf);
@@ -336,6 +345,7 @@ static void process_feed(const char*status,const char*kind){
         for(int i=nids-1;i>=0;i--){ if(!seen_has(fi,ids[i])){ strncpy(notify[nn],ids[i],31); notify[nn][31]=0; nn++; } }
     }
     printf("[Worker] feed %s: %d run(s), primed=%d, notify=%d\n",kind,nids,(int)was_primed,nn); fflush(stdout);
+    log_rss(kind);
     /* update seen and highwater */
     for(int i=0;i<nids;i++){ seen_add(fi,ids[i]); }
     state_save_file();
@@ -366,6 +376,7 @@ int main(void){
     const char*reset=getenv("RESET_STATE");
     if(!(reset&&strcmp(reset,"1")==0)) state_load_file();
     printf("[Worker] Started; polling every %ds (game=%s %s)\n",interval_sec,game_id,GAME_NAME); fflush(stdout);
+    log_rss("startup");
     const char*test=getenv("TEST_NOTIFY");
     if(test&&strcmp(test,"1")==0) g_test_once=true;
     while(!stopflag){

@@ -1,4 +1,4 @@
-﻿# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1
 FROM alpine:3.20 AS build
 RUN apk add --no-cache gcc musl-dev make curl tar
 WORKDIR /src

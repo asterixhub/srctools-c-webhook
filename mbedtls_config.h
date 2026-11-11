@@ -2,6 +2,8 @@
 #ifndef MBEDTLS_CONFIG_H
 #define MBEDTLS_CONFIG_H
 
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+
 /* entropy / rng */
 #define MBEDTLS_NET_C
 #define MBEDTLS_FS_IO

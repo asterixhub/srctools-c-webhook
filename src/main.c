@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <errno.h>
 #include <ctype.h>
 
@@ -28,7 +29,7 @@
 #define RUN_EMBEDS "category,level,players"
 #define RUN_PAGE 10
 #define CHECK_INTERVAL 8
-#define STATE_CAP 100
+#define STATE_CAP 40
 
 typedef struct { char *d; size_t n, c; } Buf;
 typedef struct { char *s; size_t n; } Str;
@@ -135,47 +136,78 @@ static bool use_new = true, use_verified = true, use_rejected = true;
 
 static char *trim_dup(const char *s){ while(*s==' '||*s=='\t'||*s=='\r'||*s=='\n') s++; size_t n=strlen(s); while(n>0&&(s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) n--; char*o=xmalloc(n+1); memcpy(o,s,n); o[n]=0; return o; }
 
-/* ---------------- TLS client ---------------- */
-typedef struct { mbedtls_net_context net; mbedtls_ssl_context ssl; mbedtls_ssl_config conf; mbedtls_ctr_drbg_context ctr; mbedtls_entropy_context ent; bool ok; } Tls;
+/* ---------------- TLS client ----------------
+   Один контекст на всё время жизни процесса: память аллоцируется один раз,
+   а не на каждый из 3 запросов в цикле. Ответы пишем в статические буферы
+   (BSS), поэтому в куче ничего не растёт. */
+#define FEED_BUF_SIZE (128*1024)
+#define DSC_BUF_SIZE  (8*1024)
+
+static mbedtls_net_context g_net;
+static mbedtls_ssl_context g_ssl;
+static mbedtls_ssl_config g_conf;
+static mbedtls_ctr_drbg_context g_ctr;
+static mbedtls_entropy_context g_ent;
 static mbedtls_x509_crt g_cacrt;
 static bool g_ca_ready = false;
+static bool g_tls_ready = false;
+static char g_feed_buf[FEED_BUF_SIZE];
+static char g_dsc_buf[DSC_BUF_SIZE];
 
-static int tls_connect(Tls*t,const char*host,const char*port){
-    mbedtls_net_init(&t->net); mbedtls_ssl_init(&t->ssl); mbedtls_ssl_config_init(&t->conf); mbedtls_ctr_drbg_init(&t->ctr); mbedtls_entropy_init(&t->ent); t->ok=false;
-    if(mbedtls_ctr_drbg_seed(&t->ctr,mbedtls_entropy_func,&t->ent,(const unsigned char*)"s",1)!=0) return -1;
-    if(mbedtls_net_connect(&t->net,host,port,MBEDTLS_NET_PROTO_TCP)!=0) return -1;
-    if(mbedtls_ssl_config_defaults(&t->conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)!=0) return -1;
+static bool tls_setup(void){
+    if(g_tls_ready) return true;
+    mbedtls_net_init(&g_net); mbedtls_ssl_init(&g_ssl); mbedtls_ssl_config_init(&g_conf);
+    mbedtls_ctr_drbg_init(&g_ctr); mbedtls_entropy_init(&g_ent);
+    if(mbedtls_ctr_drbg_seed(&g_ctr,mbedtls_entropy_func,&g_ent,(const unsigned char*)"s",1)!=0) return false;
+    if(mbedtls_ssl_config_defaults(&g_conf,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)!=0) return false;
     if(!g_ca_ready){ mbedtls_x509_crt_init(&g_cacrt); if(mbedtls_x509_crt_parse_file(&g_cacrt,"/etc/ssl/certs/ca-certificates.crt")==0) g_ca_ready=true; else mbedtls_x509_crt_free(&g_cacrt); }
-    if(g_ca_ready){ mbedtls_ssl_conf_ca_chain(&t->conf,&g_cacrt,NULL); mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
-    else mbedtls_ssl_conf_authmode(&t->conf,MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&t->conf,mbedtls_ctr_drbg_random,&t->ctr);
-    if(mbedtls_ssl_setup(&t->ssl,&t->conf)!=0) return -1;
-    mbedtls_ssl_set_hostname(&t->ssl,host);
-    mbedtls_ssl_set_bio(&t->ssl,&t->net,mbedtls_net_send,mbedtls_net_recv,NULL);
-    int r; while((r=mbedtls_ssl_handshake(&t->ssl))!=0){ if(r!=MBEDTLS_ERR_SSL_WANT_READ&&r!=MBEDTLS_ERR_SSL_WANT_WRITE) return -1; }
-    t->ok=true; return 0;
+    if(g_ca_ready){ mbedtls_ssl_conf_ca_chain(&g_conf,&g_cacrt,NULL); mbedtls_ssl_conf_authmode(&g_conf,MBEDTLS_SSL_VERIFY_REQUIRED); }
+    else mbedtls_ssl_conf_authmode(&g_conf,MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&g_conf,mbedtls_ctr_drbg_random,&g_ctr);
+    g_tls_ready=true; return true;
 }
-static int tls_write_all(Tls*t,const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&t->ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
-static char* tls_read_all(Tls*t,size_t*olen){ Buf b; binit(&b); unsigned char tmp[4096]; for(;;){ int r=mbedtls_ssl_read(&t->ssl,tmp,sizeof tmp); if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE) continue; if(r==MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY||r==0) break; if(r<0) break; badd(&b,tmp,(size_t)r);} *olen=b.n; return b.d; }
-static void tls_close(Tls*t){ if(t->ok){ mbedtls_ssl_close_notify(&t->ssl);} mbedtls_net_free(&t->net); mbedtls_ssl_free(&t->ssl); mbedtls_ssl_config_free(&t->conf); mbedtls_ctr_drbg_free(&t->ctr); mbedtls_entropy_free(&t->ent); }
 
-static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status){
-    Tls t; if(tls_connect(&t,host,"443")!=0){ tls_close(&t); return NULL; }
+static int bio_send(void *ctx,const unsigned char*buf,size_t len){ return mbedtls_net_send(ctx,buf,len); }
+static int bio_recv(void *ctx,unsigned char*buf,size_t len){ return mbedtls_net_recv_timeout(ctx,buf,len,10000); }
+
+static int tls_connect(const char*host,const char*port){
+    if(!tls_setup()) return -1;
+    mbedtls_ssl_session_reset(&g_ssl);
+    mbedtls_net_free(&g_net); mbedtls_net_init(&g_net);
+    if(mbedtls_net_connect(&g_net,host,port,MBEDTLS_NET_PROTO_TCP)!=0) return -1;
+    mbedtls_ssl_set_hostname(&g_ssl,host);
+    mbedtls_ssl_set_bio(&g_ssl,&g_net,bio_send,bio_recv,NULL);
+    int r; while((r=mbedtls_ssl_handshake(&g_ssl))!=0){ if(r!=MBEDTLS_ERR_SSL_WANT_READ&&r!=MBEDTLS_ERR_SSL_WANT_WRITE) return -1; }
+    return 0;
+}
+static int tls_write_all(const unsigned char*buf,size_t len){ while(len>0){ int r=mbedtls_ssl_write(&g_ssl,buf,len); if(r<=0) return -1; buf+=r; len-=r; } return 0; }
+static int tls_read_all(char*dst,size_t dstsz){
+    size_t n=0; unsigned char tmp[4096]; int spins=0;
+    for(;;){ int r=mbedtls_ssl_read(&g_ssl,tmp,sizeof tmp);
+        if(r==MBEDTLS_ERR_SSL_WANT_READ||r==MBEDTLS_ERR_SSL_WANT_WRITE){ if(++spins>3) return -1; continue; }
+        if(r<=0) break; if(n+(size_t)r>=dstsz) return -1; memcpy(dst+n,tmp,(size_t)r); n+=(size_t)r; }
+    dst[n]=0; return 0;
+}
+static void tls_close(void){ mbedtls_ssl_close_notify(&g_ssl); mbedtls_net_free(&g_net); }
+
+static char *https_request(const char*host,const char*path,const char*method,const char*body,const char*extra_hdr,int*status,char*dst,size_t dstsz){
+    if(tls_connect(host,"443")!=0){ tls_close(); return NULL; }
     Buf req; binit(&req);
     bfmt(&req,"%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: s\r\nConnection: close\r\n",method,path,host);
     if(extra_hdr&&extra_hdr[0]) bputs(&req,extra_hdr);
     if(body){ bfmt(&req,"Content-Type: application/json\r\nContent-Length: %zu\r\n",strlen(body)); }
     bputs(&req,"\r\n");
     if(body) bputs(&req,body);
-    if(tls_write_all(&t,(unsigned char*)req.d,req.n)!=0){ bfree(&req); tls_close(&t); return NULL; }
+    if(tls_write_all((unsigned char*)req.d,req.n)!=0){ bfree(&req); tls_close(); return NULL; }
     bfree(&req);
-    size_t rn=0; char*resp=tls_read_all(&t,&rn); tls_close(&t);
-    if(!resp) return NULL;
+    int rc=tls_read_all(dst,dstsz);
+    tls_close();
+    if(rc!=0) return NULL;
     *status=0;
-    char*sp=strstr(resp,"\r\n\r\n"); if(!sp){ free(resp); return NULL; }
-    *sp=0; char*body_out=xstrdup(sp+4);
-    if(sscanf(resp,"HTTP/%*d.%*d %d",status)!=1) *status=0;
-    free(resp); return body_out;
+    char*sp=strstr(dst,"\r\n\r\n"); if(!sp) return NULL;
+    *sp=0; char*body_out=sp+4;
+    if(sscanf(dst,"HTTP/%*d.%*d %d",status)!=1) *status=0;
+    return body_out;
 }
 
 /* Discord webhook host/path split */
@@ -230,7 +262,7 @@ static bool send_discord(const char*kind,const char*run_url,const char*map,const
     bfmt(&pl,",\"color\":%ld}],\"allowed_mentions\":{\"parse\":[]}}",ev_color(kind));
     bool ok=false;
     for(int attempt=1;attempt<=3;attempt++){
-        int st=0; char*resp=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st); if(resp) free(resp);
+        int st=0; char*resp=https_request(wh_host,wh_path,"POST",pl.d,NULL,&st,g_dsc_buf,sizeof g_dsc_buf); (void)resp;
         if(st==204||st==200){ ok=true; break; }
         if(st==429){ msleep(1500); continue; }
         if(st>=500){ msleep(1000*attempt); continue; }
@@ -276,10 +308,10 @@ static void process_feed(const char*status,const char*kind){
     char path[512]; const char*orderby=strcmp(status,"verified")==0?"verify-date":"submitted";
     snprintf(path,sizeof path,"%s/runs?game=%s&status=%s&orderby=%s&direction=desc&embed=%s&max=%d&_=%lld",API_BASE,game_id,status,orderby,RUN_EMBEDS,RUN_PAGE,(long long)now_ms());
     char hdr[256]; const char*key=getenv("SPEEDRUN_API_KEY"); if(key&&key[0]) snprintf(hdr,sizeof hdr,"Accept: application/json\r\nX-API-Key: %s\r\n",key); else snprintf(hdr,sizeof hdr,"Accept: application/json\r\n");
-    int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st);
-    if(!body||st<200||st>=300){ printf("[Worker] feed %s: request failed (http %d)\n",kind,st); fflush(stdout); if(body) free(body); return; }
+    int st=0; char*body=https_request(API_HOST,path,"GET",NULL,hdr,&st,g_feed_buf,sizeof g_feed_buf);
+    if(!body||st<200||st>=300){ printf("[Worker] feed %s: request failed (http %d)\n",kind,st); fflush(stdout); return; }
     const char*data=find_key(body,"data");
-    if(!data||*data!='['){ free(body); return; }
+    if(!data||*data!='['){ printf("[Worker] feed %s: bad response\n",kind); fflush(stdout); return; }
 
     int fi=fidx(kind);
     /* collect run ids in order (parsed in place, no copy of the whole feed) */
@@ -315,7 +347,6 @@ static void process_feed(const char*status,const char*kind){
     }
     if(g_test_once && nids>0){ notify_run(kind,objs[0],ids[0]); g_test_once=false; }
 
-    free(body);
     state_save_file();
 }
 
